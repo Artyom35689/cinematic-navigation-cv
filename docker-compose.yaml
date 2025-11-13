@@ -1,0 +1,43 @@
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  working_dir: /app
+  volumes:
+    - ./:/app
+  # GPU при наличии: рендер на gsplat. Если на хосте нет GPU — фолбэк Open3D CPU.
+  gpus: all
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,video
+    # фолбэк для Open3D: OSMesa CPU
+    - OPEN3D_RENDERING_BACKEND=OSMESA
+    - LIBGL_ALWAYS_SOFTWARE=1
+    - MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+    - EGL_PLATFORM=surfaceless
+  devices:
+    - /dev/nvidia0:/dev/nvidia0
+    - /dev/nvidiactl:/dev/nvidiactl
+    - /dev/nvidia-uvm:/dev/nvidia-uvm
+    - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+    - /dev/nvidia-modeset:/dev/nvidia-modeset
+    - /dev/nvidia-caps/nvidia-cap1:/dev/nvidia-caps/nvidia-cap1
+    - /dev/nvidia-caps/nvidia-cap2:/dev/nvidia-caps/nvidia-cap2
+  device_cgroup_rules:
+    - 'c 195:* rmw'   # nvidia, nvidiactl, modeset
+    - 'c 507:* rmw'   # uvm
+    - 'c 510:* rmw'   # nvidia-caps
+  security_opt:
+    - seccomp=unconfined
+
+
+services:
+  app:
+    <<: *common
+    command: ["true"]  # заглушка
+
+  terminal:
+    <<: *common
+    stdin_open: true
+    tty: true
+    command: ["/bin/bash"]

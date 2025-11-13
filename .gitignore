@@ -2,3 +2,4 @@
 *.splat
 
 scenes/*
+output/*

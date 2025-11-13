@@ -1,0 +1,4 @@
+*.ply
+*.splat
+
+scenes/*

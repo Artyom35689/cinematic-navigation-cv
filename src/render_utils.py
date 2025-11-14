@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+render_utils.py
 Rendering utilities: gsplat rasterization, video writing, YOLO detection.
 """
 
@@ -51,23 +52,24 @@ def render_one_frame(
         width,
     )
 
-    images, _, _ = rasterization(
-        means_t,
-        quats_t,
-        scales_t,
-        opac_t,
-        colors_t,
-        view_t,
-        K_t,
-        width,
-        height,
-        near_plane=0.01,
-        far_plane=1e4,
-        sh_degree=None,
-        packed=True,
-        render_mode="RGB",
-        rasterize_mode="classic",
-    )
+    with torch.no_grad():
+        images, _, _ = rasterization(
+            means_t,
+            quats_t,
+            scales_t,
+            opac_t,
+            colors_t,
+            view_t,
+            K_t,
+            width,
+            height,
+            near_plane=0.01,
+            far_plane=1e4,
+            sh_degree=None,
+            packed=True,
+            render_mode="RGB",
+            rasterize_mode="classic",
+        )
 
     img = images[0].clamp(0.0, 1.0).detach().cpu().numpy()  # [H,W,3]
     logging.info(
@@ -115,23 +117,24 @@ def render_frames_gsplat(
 
         logging.info("[INFO] [gsplat] frame %d/%d", i + 1, num_frames)
 
-        colors, alphas, meta = rasterization(
-            means_t,
-            quats_t,
-            scales_t,
-            opac_t,
-            colors_t,
-            view_t,
-            Ks,
-            width,
-            height,
-            near_plane=0.01,
-            far_plane=1e4,
-            sh_degree=None,
-            packed=True,
-            render_mode="RGB",
-            rasterize_mode="classic",
-        )
+        with torch.no_grad():
+            colors, alphas, meta = rasterization(
+                means_t,
+                quats_t,
+                scales_t,
+                opac_t,
+                colors_t,
+                view_t,
+                Ks,
+                width,
+                height,
+                near_plane=0.01,
+                far_plane=1e4,
+                sh_degree=None,
+                packed=True,
+                render_mode="RGB",
+                rasterize_mode="classic",
+            )
 
         frame_rgb = colors[0].clamp(0.0, 1.0).detach().cpu().numpy()
         if frame_rgb.shape != (height, width, 3):
@@ -181,9 +184,6 @@ def write_video(frames_bgr: List[np.ndarray], out_path: Path, fps: int) -> None:
         fps,
     )
 
-    stack = np.stack(frames_bgr, axis=0)  # [T,H,W,3]
-    frames_bytes = stack.tobytes()
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     process = (
@@ -204,11 +204,115 @@ def write_video(frames_bgr: List[np.ndarray], out_path: Path, fps: int) -> None:
         .run_async(pipe_stdin=True, quiet=True)
     )
 
-    process.stdin.write(frames_bytes)
+    # Пишем кадры по одному, без большого np.stack в памяти
+    for f in frames_bgr:
+        process.stdin.write(f.tobytes())
+
     process.stdin.close()
     ret = process.wait()
     if ret != 0:
         raise RuntimeError(f"ffmpeg returned non-zero exit code: {ret}")
+
+
+# ---------------------------------------------------------------------
+# Потоковый рендер напрямую в ffmpeg
+# ---------------------------------------------------------------------
+
+def render_path_gsplat_to_video(
+    gauss: GaussiansNP,
+    poses: List[Dict[str, Any]],
+    width: int,
+    height: int,
+    fov_deg: float,
+    device: torch.device,
+    out_path: Path,
+    fps: int,
+) -> None:
+    """
+    Рендерим траекторию gsplat'ом и СРАЗУ пишем в mp4 через ffmpeg (rawvideo pipeline).
+
+    Ничего не возвращаем, кадры нигде не храним — память почти не растёт
+    с длиной ролика.
+    """
+    logging.info("[INFO] Streaming render to video: %s", out_path)
+
+    means_t = torch.from_numpy(gauss.means).to(device)
+    quats_t = torch.from_numpy(gauss.quats).to(device)
+    scales_t = torch.from_numpy(gauss.scales).to(device)
+    opac_t = torch.from_numpy(gauss.opacities).to(device)
+    colors_t = torch.from_numpy(gauss.colors).to(device)
+
+    K_np = build_intrinsics(fov_deg, width, height)
+    Ks = torch.from_numpy(K_np.astype(np.float32)).to(device)[None, :, :]  # [1,3,3]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ffmpeg-процесс, принимающий rawvideo по stdin
+    process = (
+        ffmpeg
+        .input(
+            "pipe:",
+            format="rawvideo",
+            pix_fmt="bgr24",
+            s=f"{width}x{height}",
+            r=fps,
+        )
+        .output(
+            str(out_path),
+            vcodec="libx264",
+            pix_fmt="yuv420p",
+        )
+        .overwrite_output()
+        .run_async(pipe_stdin=True, quiet=True)
+    )
+
+    num_frames = len(poses)
+    for i, pose in enumerate(poses):
+        view_np = np.asarray(pose["view"], dtype=np.float32)
+        view_t = torch.from_numpy(view_np).to(device)[None, :, :]  # [1,4,4]
+
+        logging.info("[INFO] [gsplat-stream] frame %d/%d", i + 1, num_frames)
+
+        with torch.no_grad():
+            colors, alphas, meta = rasterization(
+                means_t,
+                quats_t,
+                scales_t,
+                opac_t,
+                colors_t,
+                view_t,
+                Ks,
+                width,
+                height,
+                near_plane=0.01,
+                far_plane=1e4,
+                sh_degree=None,
+                packed=True,
+                render_mode="RGB",
+                rasterize_mode="classic",
+            )
+
+        frame_rgb = colors[0].clamp(0.0, 1.0).detach().cpu().numpy()
+        if frame_rgb.shape != (height, width, 3):
+            process.stdin.close()
+            process.wait()
+            raise RuntimeError(
+                f"Unexpected frame shape from gsplat: {frame_rgb.shape}, "
+                f"expected ({height}, {width}, 3)"
+            )
+
+        frame_u8 = (frame_rgb * 255.0 + 0.5).astype(np.uint8)
+        frame_bgr = frame_u8[..., ::-1]  # RGB -> BGR
+
+        # Пишем прямо в stdin ffmpeg, без накопления в списке
+        process.stdin.write(frame_bgr.tobytes())
+
+    process.stdin.close()
+    ret = process.wait()
+    if ret != 0:
+        raise RuntimeError(f"ffmpeg (stream) returned non-zero exit code: {ret}")
+
+    logging.info("[INFO] Streaming render finished: %s", out_path)
 
 
 # ---------------------------------------------------------------------

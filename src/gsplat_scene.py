@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+
 Scene utilities for 3D Gaussian Splatting (unpacked .ply):
 
 Expected vertex layout:

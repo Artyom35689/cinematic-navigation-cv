@@ -1,0 +1,38 @@
+scene:
+  ply: "scenes/ConferenceHall.ply"
+  max_splats: 2000000
+
+output:
+  dir: "output/ConferenceHall_manual"
+
+render:
+  fps: 24
+  fov_deg: 70
+  res: [1280, 720]
+  seconds: 8
+  device: "cuda"
+
+path:
+  mode: "astar_waypoints"
+  waypoints_world:
+    - [28.0, 30.0]
+    - [20.0, 22.0]
+    - [10.0, 25.0]
+
+  cell_size: 0.5
+  margin_cells: 2
+
+  height_fraction: 0.3
+  cam_height_rel: 1.7
+  min_headroom: 0.5
+
+  frames_per_meter: 25
+  smooth_window: 9
+  back_offset: 0.5
+  snap_radius: 10
+  overlay_path: false
+
+detection:
+  enabled: true
+  model: "yolov8n.pt"
+  conf: 0.25

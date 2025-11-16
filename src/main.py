@@ -4,18 +4,19 @@
 Simple cinematic navigation pipeline:
 
   - load unpacked 3DGS PLY into GaussiansNP
-  - generate simple orbit camera path around bbox
-  - render frames with gsplat
+  - generate simple straight camera path through given waypoints (XZ plane, Y up)
+  - render frames with gsplat (streaming into ffmpeg)
   - write MP4 via ffmpeg
-  - optionally run YOLO detection on rendered video
+  - optionally run YOLO detection on rendered video (on the fly)
 
+
+Пример запуска:
 
 python3 -m src.main \
      --scene scenes/ConferenceHall.ply \
      --outdir output/ConferenceHall_demo \
-     --seconds 4 --fps 24 --fov 70 --res 1280x720 \
-     --max-splats 200000000
-
+     --seconds 35 --fps 30 --fov 70 --res 1280x720 \
+     --max-splats 20000000
 """
 
 from __future__ import annotations
@@ -29,8 +30,8 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 
-from .gsplat_scene import load_gaussians_from_ply, generate_camera_poses
-from .render_utils import render_frames_gsplat, write_video, run_detection
+from .gsplat_scene import load_gaussians_from_ply, generate_camera_poses_straight_path
+from .render_utils import render_gsplat_to_video_streaming
 
 
 # ---------------------------------------------------------------------
@@ -44,25 +45,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--scene",
         type=str,
-        required=True,
+        default="scenes/ConferenceHall.ply",
         help="Path to unpacked 3DGS .ply scene.",
     )
     p.add_argument(
         "--outdir",
         type=str,
-        required=True,
+        default="output/demo_gsplat",
         help="Output directory for video and JSON.",
     )
     p.add_argument(
         "--seconds",
         type=float,
-        default=4.0,
+        default=35.0,
         help="Duration of the fly-through in seconds.",
     )
     p.add_argument(
         "--fps",
         type=int,
-        default=24,
+        default=30,
         help="Frames per second.",
     )
     p.add_argument(
@@ -80,24 +81,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-splats",
         type=int,
-        default=2_000_000,
+        default=20_000_000,
         help="Max number of Gaussians to keep (random downsampling if exceeded).",
     )
     p.add_argument(
         "--detect",
         action="store_true",
+        default=True,
         help="Run YOLO detection on rendered frames.",
     )
     p.add_argument(
         "--model",
         type=str,
-        default="yolov8n.pt",
-        help="YOLO model path/name for detection.",
+        default="models/yolo12n.pt",
+        help="YOLO model path & name for detection.",
     )
     p.add_argument(
         "--conf",
         type=float,
-        default=0.25,
+        default=0.5,
         help="YOLO confidence threshold.",
     )
     return p.parse_args()
@@ -112,6 +114,7 @@ def main() -> None:
         level=logging.INFO,
         format="[%(levelname)s] %(message)s",
     )
+    logger = logging.getLogger(__name__)
 
     args = parse_args()
 
@@ -126,8 +129,8 @@ def main() -> None:
         raise SystemExit(f"Invalid --res '{args.res}', expected WxH, got error: {e}")
 
     num_frames = max(1, int(round(args.seconds * args.fps)))
-    logging.info(
-        "[INFO] Frames to render: %d at %d FPS, %dx%d, FOV=%.1f",
+    logger.info(
+        "[MAIN] Frames to render: %d at %d FPS, %dx%d, FOV=%.1f",
         num_frames,
         args.fps,
         width,
@@ -138,8 +141,20 @@ def main() -> None:
     # Load Gaussians
     gauss = load_gaussians_from_ply(str(scene_path), max_points=args.max_splats)
 
-    # Camera poses (simple orbit)
-    poses = generate_camera_poses(gauss.means, num_frames)
+    # Camera poses: прямой путь по XZ через заданные точки
+    waypoints_xz = [
+        [28.0, 30.0],
+        [20.0, 22.0],
+        [10.0, 25.0],
+    ]
+
+    poses = generate_camera_poses_straight_path(
+        gauss.means,
+        num_frames,
+        waypoints_xz=waypoints_xz,
+        height_fraction=0.0,      # при необходимости можно поднять камеру
+        lookahead_fraction=0.05,  # насколько далеко вперёд по пути смотрим
+    )
 
     # Device
     if not torch.cuda.is_available():
@@ -149,51 +164,61 @@ def main() -> None:
         )
     device = torch.device("cuda")
 
-    # Render frames
-    frames_bgr = render_frames_gsplat(
-        gauss,
-        poses,
+    # Output video path
+    out_mp4 = outdir / "panorama_tour.mp4"
+
+    # Render + stream to video (и опциональный YOLO)
+    dets = render_gsplat_to_video_streaming(
+        gauss=gauss,
+        poses=poses,
         width=width,
         height=height,
         fov_deg=args.fov,
         device=device,
+        out_path=out_mp4,
+        fps=args.fps,
+        detect=args.detect,
+        yolo_model_path=args.model,
+        yolo_conf=args.conf,
+        draw_boxes=args.detect,  # если детектим — сразу и рисуем
     )
 
-    # Video
-    out_mp4 = outdir / "panorama_tour.mp4"
-    write_video(frames_bgr, out_mp4, fps=args.fps)
-    logging.info("[INFO] Video written: %s", out_mp4)
+    logger.info("[MAIN] Video written: %s", out_mp4)
 
     # Camera path JSON
     cam_json = outdir / "camera_path.json"
+    meta_frames: List[Dict[str, Any]] = []
+    for i, pose in enumerate(poses):
+        meta_frames.append(
+            {
+                "index": i,
+                "eye": pose["eye"],
+                "center": pose["center"],
+                "view": np.asarray(pose["view"], dtype=float).tolist(),
+            }
+        )
+
     meta = {
         "scene": str(scene_path),
         "resolution": [width, height],
         "fps": args.fps,
         "seconds": args.seconds,
         "fov_deg": args.fov,
-        "frames": [
-            {
-                "index": i,
-                "eye": poses[i]["eye"],
-                "center": poses[i]["center"],
-                "view": np.asarray(poses[i]["view"], dtype=float).tolist(),
-            }
-            for i in range(len(poses))
-        ],
+        "frames": meta_frames,
         "render_backend": "gsplat_rgb",
+        "path_type": "straight_polyline_xz",
+        "waypoints_xz": waypoints_xz,
     }
     with cam_json.open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-    logging.info("[INFO] Camera path JSON written: %s", cam_json)
+    logger.info("[MAIN] Camera path JSON written: %s", cam_json)
 
-    # Optional YOLO
-    if args.detect:
-        dets = run_detection(frames_bgr, args.model, args.conf)
+    # Optional YOLO detections (уже посчитаны по кадрам на лету)
+    if args.detect and dets is not None:
         det_json = outdir / "detections_yolo.json"
         with det_json.open("w", encoding="utf-8") as f:
             json.dump({"detections": dets}, f, indent=2)
-        logging.info("[INFO] YOLO detections JSON written: %s", det_json)
+        logger.info("[MAIN] YOLO detections JSON written: %s", det_json)
 
 
 if __name__ == "__main__":

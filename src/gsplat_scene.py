@@ -52,7 +52,7 @@ class GaussiansNP:
 
 def load_gaussians_from_ply(path: str, max_points: Optional[int] = 2_000_000) -> GaussiansNP:
     """
-    Load Gaussians from a full 3DGS PLY (unpacked, см. описание сверху).
+    Load Gaussians from a full 3DGS PLY.
 
     Heuristics:
       - scales: если много отрицательных значений -> считаем log-stddev и делаем exp().
@@ -259,6 +259,129 @@ def build_camera(means: np.ndarray,
     )
 
     return view, K
+import logging
+
+logger = logging.getLogger(__name__)
+
+def generate_camera_poses_straight_path(
+    means: np.ndarray,
+    num_frames: int,
+    waypoints_xz: List[List[float]] | np.ndarray,
+    height_fraction: float = 3.0,
+    lookahead_fraction: float = 0.05,
+) -> List[Dict[str, Any]]:
+    """
+    Generate camera poses that move along a polyline in the XZ plane.
+
+    - World up axis: Y
+    - Camera moves along given waypoints in XZ: [(x0, z0), (x1, z1), ...]
+    - Camera height (Y) is constant and derived from scene bbox.
+    - Camera looks forward along the path (look-ahead), which gives smooth rotation.
+
+    Args:
+        means: (N,3) Gaussian means, used only to estimate bbox/height.
+        num_frames: total frames to generate.
+        waypoints_xz: list/array of [x, z] waypoints in world coordinates (XZ plane).
+        height_fraction: camera Y offset as fraction of scene diagonal.
+        lookahead_fraction: how far ahead along the total path (in [0, 1]) to look.
+
+    Returns:
+        List of dicts {"view": 4x4, "eye": [3], "center": [3]}.
+    """
+    waypoints_xz = np.asarray(waypoints_xz, dtype=np.float32)  # [M,2]
+    if waypoints_xz.shape[0] < 2:
+        raise ValueError("Need at least two waypoints for a straight path")
+
+    # Scene bbox / center for height
+    bbox_min = means.min(axis=0)
+    bbox_max = means.max(axis=0)
+    center = 0.5 * (bbox_min + bbox_max)
+    diag = float(np.linalg.norm(bbox_max - bbox_min)) + 1e-6
+
+    center_y = float(center[1])
+    cam_y = center_y + height_fraction * diag
+
+    # Build 3D waypoints in XZ plane with constant Y
+    # X,Z come from waypoints; Y is cam_y.
+    waypoints = np.stack(
+        [waypoints_xz[:, 0], np.full_like(waypoints_xz[:, 0], cam_y), waypoints_xz[:, 1]],
+        axis=1,
+    )  # [M,3]
+
+    # Precompute segment lengths and cumulative distances
+    seg_vecs = waypoints[1:] - waypoints[:-1]  # [M-1,3]
+    seg_lens = np.linalg.norm(seg_vecs, axis=1)  # [M-1]
+    if np.any(seg_lens <= 0):
+        raise ValueError("Found zero-length segment in waypoints")
+
+    cum_lens = np.concatenate([[0.0], np.cumsum(seg_lens)])  # [M]
+    total_len = float(cum_lens[-1])
+
+    logger.info(
+        "[PATH/STRAIGHT] total_len=%.3f, num_segments=%d, num_frames=%d",
+        total_len,
+        len(seg_lens),
+        num_frames,
+    )
+
+    def point_at_s(s: float) -> np.ndarray:
+        """Return 3D point along polyline at arc length s (clamped to [0, total_len])."""
+        s = np.clip(s, 0.0, total_len)
+        # find segment index j such that s in [cum_lens[j], cum_lens[j+1]]
+        j = np.searchsorted(cum_lens, s, side="right") - 1
+        j = max(0, min(j, len(seg_lens) - 1))
+        s0 = cum_lens[j]
+        seg_len = seg_lens[j]
+        if seg_len <= 0:
+            return waypoints[j]
+        t_local = (s - s0) / seg_len
+        return waypoints[j] * (1.0 - t_local) + waypoints[j + 1] * t_local
+
+    poses: List[Dict[str, Any]] = []
+    if num_frames <= 1:
+        # Degenerate case: put camera at first waypoint and look toward second
+        eye = waypoints[0]
+        look_target = waypoints[1]
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        view = look_at(eye, look_target, up)
+        poses.append(
+            {
+                "view": view,
+                "eye": eye.tolist(),
+                "center": look_target.tolist(),
+            }
+        )
+        return poses
+
+    # How far ahead along the path we look (in absolute length)
+    lookahead_dist = float(lookahead_fraction) * total_len
+
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    for i in range(num_frames):
+        # s: position along path
+        t = i / float(num_frames - 1)
+        s = t * total_len
+
+        eye = point_at_s(s)
+        target = point_at_s(min(s + lookahead_dist, total_len))
+
+        view = look_at(eye, target, up)
+
+        poses.append(
+            {
+                "view": view,
+                "eye": eye.tolist(),
+                "center": target.tolist(),
+            }
+        )
+
+    logger.info(
+        "[PATH/STRAIGHT] generated %d poses along polyline through %d waypoints",
+        len(poses),
+        waypoints_xz.shape[0],
+    )
+    return poses
 
 
 def generate_camera_poses(

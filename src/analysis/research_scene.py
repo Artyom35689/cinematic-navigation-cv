@@ -3,17 +3,18 @@
 """
 Scene research utilities.
 
-Запуск (из корня проекта, где src — пакет):
+Usage (from project root, where src is a package):
 
   python3 -m src.analysis.research_scene \
       --scene scenes/ConferenceHall.ply \
       --outdir output/scene_research \
-      --grid-res 256 \
+      --grid-res 512 \
       --slice-thickness-frac 0.15 \
-      --num-slices 10
+      --num-slices 10 \
+      --plot-3d
 
-Требуется:
-  - существующий src/gsplat_scene.py с load_gaussians_from_ply;
+Requirements:
+  - existing src/gsplat_scene.py with load_gaussians_from_ply;
   - matplotlib (pip install matplotlib).
 """
 
@@ -22,14 +23,15 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List, Dict, Any, Optional
 
 import numpy as np
 
-from ..gsplat_scene import load_gaussians_from_ply  # используем уже рабочий код
+from ..gsplat_scene import load_gaussians_from_ply  # reuse existing loader
 
 try:
     import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D)
 except ImportError:
     plt = None
 
@@ -38,23 +40,23 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
-# Quaternion helper (WXYZ, как в 3DGS PLY / SPZ спецификации)
+# Quaternion helpers (WXYZ, as in 3DGS PLY / SPZ spec)
 # ---------------------------------------------------------------------
 
 
 def quat_forward_axis_wxyz(quats: np.ndarray) -> np.ndarray:
     """
-    Для каждого кватерниона (w,x,y,z) возвращает направление локальной оси Z
-    в мировых координатах.
+    For each quaternion (w,x,y,z) returns the direction of its local Z axis
+    in world coordinates.
 
-    По документации 3DGS PLY / SPZ:
-      rot_0, rot_1, rot_2, rot_3 = W, X, Y, Z (нормализованный кватернион):contentReference[oaicite:1]{index=1}
+    According to 3DGS PLY / SPZ:
+      rot_0, rot_1, rot_2, rot_3 = W, X, Y, Z (normalized quaternion).
 
-    Возвращает:
-      dirs: [N, 3] float32, единичные векторы.
+    Returns:
+      dirs: [N, 3] float32, unit vectors.
     """
     q = np.asarray(quats, dtype=np.float32)
-    if q.shape[1] != 4:
+    if q.ndim != 2 or q.shape[1] != 4:
         raise ValueError(f"Expected quats shape (N,4), got {q.shape}")
 
     w = q[:, 0]
@@ -62,8 +64,8 @@ def quat_forward_axis_wxyz(quats: np.ndarray) -> np.ndarray:
     y = q[:, 2]
     z = q[:, 3]
 
-    # Третья колонка матрицы вращения (R @ [0,0,1]^T)
-    # R по стандартной формуле для WXYZ:
+    # Third column of rotation matrix (R @ [0,0,1]^T)
+    # R for WXYZ:
     # R[0,2] = 2(xz + wy)
     # R[1,2] = 2(yz - wx)
     # R[2,2] = 1 - 2(x^2 + y^2)
@@ -72,7 +74,7 @@ def quat_forward_axis_wxyz(quats: np.ndarray) -> np.ndarray:
     dir_z = 1.0 - 2.0 * (x * x + y * y)
 
     dirs = np.stack([dir_x, dir_y, dir_z], axis=1)
-    # нормализация для численной устойчивости
+    # Normalize for numerical stability
     norm = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-8
     dirs = dirs / norm
     return dirs.astype(np.float32)
@@ -80,21 +82,27 @@ def quat_forward_axis_wxyz(quats: np.ndarray) -> np.ndarray:
 
 def forward_angles_y_up(dirs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Для направлений (единичные векторы) считает:
-      - azimuth_deg: угол в плоскости XZ относительно +Z (yaw), [-180, 180]
-      - elevation_deg: угол относительно плоскости XZ (наклон), [-90, 90]
+    For unit direction vectors returns:
+      - azimuth_deg: angle in XZ plane relative to +Z (yaw), [-180, 180]
+      - elevation_deg: angle above XZ plane (pitch), [-90, 90]
 
-    dirs: [N,3], предполагается Y — вверх.
+    Assumes world up axis is Y.
+
+    Args:
+        dirs: [N,3] float32, unit vectors.
+
+    Returns:
+        (azimuth_deg, elevation_deg) as float32 arrays.
     """
     dirs = np.asarray(dirs, dtype=np.float32)
     dx = dirs[:, 0]
     dy = dirs[:, 1]
     dz = dirs[:, 2]
 
-    # азимут: atan2(X, Z), чтобы yaw=0 смотрел по +Z
+    # Azimuth: atan2(X, Z) so that yaw=0 looks along +Z
     azimuth = np.arctan2(dx, dz)
 
-    # наклон: относительно XZ плоскости
+    # Elevation: angle w.r.t. XZ plane
     horiz_len = np.sqrt(dx * dx + dz * dz) + 1e-8
     elevation = np.arctan2(dy, horiz_len)
 
@@ -104,7 +112,7 @@ def forward_angles_y_up(dirs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 
 # ---------------------------------------------------------------------
-# Plot helpers
+# Plot helpers (2D)
 # ---------------------------------------------------------------------
 
 
@@ -122,8 +130,12 @@ def save_histogram(
     xlabel: str,
     bins: int = 128,
 ) -> None:
+    """
+    Save a simple 1D histogram for a given array.
+    """
     _ensure_matplotlib()
     data = np.asarray(data, dtype=np.float32)
+
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.hist(data, bins=bins, alpha=0.8)
     ax.set_title(title)
@@ -131,6 +143,8 @@ def save_histogram(
     ax.set_ylabel("count")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)
     logger.info("[PLOT] Saved histogram: %s", out_path)
@@ -143,7 +157,13 @@ def save_density_xz(
     title: str,
 ) -> None:
     """
-    Глобальная карта плотности проекции на XZ (вид сверху).
+    Global density map of the scene in XZ plane (top-down view).
+
+    Args:
+        means: (N,3) Gaussian means.
+        out_path: where to save PNG.
+        grid_res: resolution of the 2D grid (grid_res x grid_res).
+        title: plot title.
     """
     _ensure_matplotlib()
     xyz = np.asarray(means, dtype=np.float32)
@@ -166,13 +186,16 @@ def save_density_xz(
         origin="lower",
         extent=[x_min, x_max, z_min, z_max],
         aspect="equal",
+        cmap="viridis",
     )
     ax.set_title(title)
     ax.set_xlabel("X")
     ax.set_ylabel("Z")
     fig.colorbar(im, ax=ax, label="point density")
     fig.tight_layout()
-    fig.savefig(out_path)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
     plt.close(fig)
     logger.info("[PLOT] Saved XZ density map: %s", out_path)
 
@@ -185,27 +208,25 @@ def save_y_slices_xz(
     num_slices: int,
 ) -> None:
     """
-    Серия горизонтальных срезов по Y в XZ-плоскости.
+    Generate a series of horizontal slices over Y, visualized in XZ plane.
 
-    Диапазон по Y задаётся относительно размеров сцены:
-      - сцена по Y: [y_min, y_max]
-      - высота сцены: H = y_max - y_min
+    Scene bounds along Y:
+      - [y_min, y_max]
+      - scene height: H = y_max - y_min
 
-    Толщина слоя задаётся как доля высоты сцены:
+    Slice thickness is specified as a fraction of the scene height:
       thickness = thickness_frac * H
 
-    Количество слоёв задаётся явно (num_slices).
-    Положение слоёв равномерно распределяется от y_min до y_max так, чтобы:
-      - если num_slices == 1: центр одного слоя в середине,
-      - если num_slices > 1: первый слой начинается у y_min,
-        последний не выходит за y_max.
+    The number of slices is specified directly (num_slices).
+    Slice positions are evenly distributed over [y_min, y_max], with clamping
+    so that slices do not go out of the scene bounds.
 
     Args:
-        means: (N,3) точки гауссиан.
-        outdir: куда сохранять PNG.
-        grid_res: разрешение карты плотности (grid_res x grid_res).
-        thickness_frac: толщина слоя в долях высоты сцены (0..1).
-        num_slices: количество слоёв (>=1).
+        means: (N,3) Gaussian means.
+        outdir: directory where slice PNGs will be saved.
+        grid_res: resolution of the 2D grid for each slice.
+        thickness_frac: slice thickness as fraction of scene height (0..1).
+        num_slices: number of slices (>=1).
     """
     _ensure_matplotlib()
     xyz = np.asarray(means, dtype=np.float32)
@@ -226,7 +247,6 @@ def save_y_slices_xz(
         logger.warning("[SLICES] num_slices <= 0, skipping slices.")
         return
 
-    # Толщина слоя как доля высоты сцены
     thickness = thickness_frac * height
     if thickness <= 0:
         logger.warning("[SLICES] Non-positive slice thickness, skipping slices.")
@@ -250,34 +270,32 @@ def save_y_slices_xz(
         num_slices,
     )
 
-    # Расчёт стартов слоёв:
-    # - num_slices == 1: один слой по центру
-    # - num_slices > 1: первый слой начинается у y_min, последний не выходит за y_max
-    starts = []
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Slice ranges:
+    # - num_slices == 1: center slice.
+    # - num_slices > 1: first starts at y_min, last does not exceed y_max.
+    ranges: List[Tuple[float, float]] = []
     if num_slices == 1:
         center_y = 0.5 * (y_min + y_max)
         y0 = center_y - 0.5 * thickness
         y1 = center_y + 0.5 * thickness
         y0 = max(y_min, y0)
         y1 = min(y_max, y1)
-        starts.append((y0, y1))
+        ranges.append((y0, y1))
     else:
-        # Общий доступный интервал для "центров" слоёв:
-        # y_min .. (y_max - thickness)
         max_start = y_max - thickness
         if max_start <= y_min:
-            # Тогда все слои фактически перекроют весь диапазон Y
-            y0 = y_min
-            y1 = y_max
-            starts = [(y0, y1)] * num_slices
+            # All slices effectively cover full Y
+            ranges = [(y_min, y_max)] * num_slices
         else:
             step = (max_start - y_min) / float(num_slices - 1)
             for i in range(num_slices):
                 y0 = y_min + i * step
                 y1 = y0 + thickness
-                starts.append((y0, y1))
+                ranges.append((y0, y1))
 
-    for slice_idx, (y0, y1) in enumerate(starts):
+    for slice_idx, (y0, y1) in enumerate(ranges):
         mask = (y >= y0) & (y < y1)
         pts = xyz[mask]
         if pts.shape[0] == 0:
@@ -302,6 +320,7 @@ def save_y_slices_xz(
             origin="lower",
             extent=[x_min, x_max, z_min, z_max],
             aspect="equal",
+            cmap="viridis",
         )
         ax.set_title(f"Y slice [{y0:.2f}, {y1:.2f}]")
         ax.set_xlabel("X")
@@ -310,7 +329,7 @@ def save_y_slices_xz(
         fig.tight_layout()
 
         out_path = outdir / f"slice_y_{slice_idx:03d}_{y0:.2f}_{y1:.2f}.png"
-        fig.savefig(out_path)
+        fig.savefig(out_path, dpi=150)
         plt.close(fig)
         logger.info(
             "[PLOT] Saved Y-slice %d: [%.3f, %.3f], pts=%d -> %s",
@@ -322,6 +341,346 @@ def save_y_slices_xz(
         )
 
 
+# ---------------------------------------------------------------------
+# Camera path visualization on XZ density (with height)
+# ---------------------------------------------------------------------
+
+
+def save_camera_path_on_density_xz(
+    means: np.ndarray,
+    poses: List[Dict[str, Any]],
+    out_path: Path,
+    grid_res: int = 512,
+    arrow_stride: int = 10,
+) -> None:
+    """
+    Plot camera path and view direction on XZ density map of the scene.
+    Camera height (Y) is visualized via color.
+
+    Assumptions:
+      - World up axis: Y.
+      - Camera moves on XZ plane, eye = [x, y, z].
+      - Density map is built from all splats projected onto XZ.
+
+    Args:
+        means: (N,3) Gaussian means.
+        poses: list of dicts with keys "eye" and "center"
+               (as produced by generate_camera_poses_*).
+        out_path: path to PNG output.
+        grid_res: resolution of the XZ density grid.
+        arrow_stride: draw an arrow every k-th frame to avoid clutter.
+    """
+    _ensure_matplotlib()
+
+    xyz = np.asarray(means, dtype=np.float32)
+    x = xyz[:, 0]
+    z = xyz[:, 2]
+
+    x_min, x_max = float(x.min()), float(x.max())
+    z_min, z_max = float(z.min()), float(z.max())
+
+    # Scene density map in XZ
+    H, _, _ = np.histogram2d(
+        x,
+        z,
+        bins=grid_res,
+        range=[[x_min, x_max], [z_min, z_max]],
+    )
+
+    if not poses:
+        logger.warning("[CAM-PATH] No poses provided, skipping camera path plot.")
+        return
+
+    eyes = np.asarray([p["eye"] for p in poses], dtype=np.float32)      # [T,3]
+    centers = np.asarray([p["center"] for p in poses], dtype=np.float32)  # [T,3]
+
+    cam_x = eyes[:, 0]
+    cam_y = eyes[:, 1]
+    cam_z = eyes[:, 2]
+
+    # Forward direction in XZ
+    dir_x = centers[:, 0] - eyes[:, 0]
+    dir_z = centers[:, 2] - eyes[:, 2]
+    dirs = np.stack([dir_x, dir_z], axis=1)
+    norms = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-8
+    dirs_norm = dirs / norms  # unit vectors in XZ
+
+    # Arrow length relative to scene span
+    x_span = max(1e-6, x_max - x_min)
+    z_span = max(1e-6, z_max - z_min)
+    arrow_len = 0.05 * max(x_span, z_span)
+
+    # Height-based coloring (Y)
+    y_min, y_max = float(cam_y.min()), float(cam_y.max())
+    y_span = max(1e-6, y_max - y_min)
+    norm_y = (cam_y - y_min) / y_span  # [0,1]
+    cmap = plt.cm.plasma
+
+    logger.info(
+        "[CAM-PATH] Plotting %d poses on XZ density (grid_res=%d), arrow_stride=%d",
+        len(poses),
+        grid_res,
+        arrow_stride,
+    )
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    # Density background
+    im = ax.imshow(
+        H.T,
+        origin="lower",
+        extent=[x_min, x_max, z_min, z_max],
+        aspect="equal",
+        cmap="gray",
+    )
+    fig.colorbar(im, ax=ax, label="point density")
+
+    # Path outline (light line)
+    ax.plot(cam_x, cam_z, color="white", linewidth=1.0, alpha=0.6, label="camera path")
+
+    # Height-colored points along path
+    sc = ax.scatter(
+        cam_x,
+        cam_z,
+        c=norm_y,
+        cmap=cmap,
+        s=10,
+        alpha=0.9,
+        label="camera samples (height)",
+    )
+    cbar = fig.colorbar(sc, ax=ax, label="camera height (normalized Y)")
+
+    # Arrows for view direction (subsampled)
+    idxs = np.arange(0, len(poses), max(1, arrow_stride))
+    ax.quiver(
+        cam_x[idxs],
+        cam_z[idxs],
+        dirs_norm[idxs, 0] * arrow_len,
+        dirs_norm[idxs, 1] * arrow_len,
+        angles="xy",
+        scale_units="xy",
+        scale=1.0,
+        color="cyan",
+        width=0.003,
+        label="view direction (sampled)",
+    )
+
+    # Mark start / end
+    ax.scatter(cam_x[0], cam_z[0], c="green", s=60, marker="o", label="start")
+    ax.scatter(cam_x[-1], cam_z[-1], c="magenta", s=60, marker="x", label="end")
+
+    ax.set_title("Camera path & view direction on XZ density (height-colored)")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Z")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.2)
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+    logger.info("[CAM-PATH] Saved camera path plot: %s", out_path)
+
+
+# ---------------------------------------------------------------------
+# 3D visualization helpers
+# ---------------------------------------------------------------------
+
+
+def save_scene_points_3d(
+    means: np.ndarray,
+    out_path: Path,
+    max_points: int = 100_000,
+) -> None:
+    """
+    Save a coarse 3D scatter plot of the scene.
+
+    Args:
+        means: (N,3) Gaussian means.
+        out_path: PNG path.
+        max_points: maximum number of points to render (random subsample).
+    """
+    _ensure_matplotlib()
+    xyz = np.asarray(means, dtype=np.float32)
+    N = xyz.shape[0]
+
+    if N == 0:
+        logger.warning("[PLOT-3D] Scene has zero points, skipping 3D scatter.")
+        return
+
+    if N > max_points:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(N, size=max_points, replace=False)
+        pts = xyz[idx]
+        logger.info(
+            "[PLOT-3D] Downsampling scene points %d -> %d for 3D scatter.",
+            N,
+            max_points,
+        )
+    else:
+        pts = xyz
+
+    xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
+
+    fig = plt.figure(figsize=(7, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    ax.scatter(
+        xs,
+        ys,
+        zs,
+        s=1,
+        c=zs,
+        cmap="viridis",
+        alpha=0.6,
+    )
+
+    ax.set_title("Scene points (3D view)")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.view_init(elev=20.0, azim=60.0)  # some reasonable default view
+    fig.tight_layout()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+    logger.info("[PLOT-3D] Saved 3D scene scatter: %s", out_path)
+
+
+def save_camera_path_3d(
+    means: np.ndarray,
+    poses: List[Dict[str, Any]],
+    out_path: Path,
+    max_points: int = 50_000,
+    arrow_stride: int = 10,
+) -> None:
+    """
+    Save a 3D plot of the scene and camera path.
+
+    - Points: coarse subsample of the scene.
+    - Camera path: polyline through eye positions.
+    - View direction: arrows at every arrow_stride frames.
+
+    Args:
+        means: (N,3) Gaussian means.
+        poses: list of dicts with keys "eye" and "center".
+        out_path: PNG path.
+        max_points: maximum number of scene points to show.
+        arrow_stride: draw viewing direction arrows every k frames.
+    """
+    _ensure_matplotlib()
+    if not poses:
+        logger.warning("[PLOT-3D] No poses provided, skipping camera path 3D plot.")
+        return
+
+    xyz = np.asarray(means, dtype=np.float32)
+    N = xyz.shape[0]
+
+    if N > max_points:
+        rng = np.random.default_rng(1)
+        idx = rng.choice(N, size=max_points, replace=False)
+        pts = xyz[idx]
+        logger.info(
+            "[PLOT-3D] Downsampling scene points %d -> %d for 3D cam path plot.",
+            N,
+            max_points,
+        )
+    else:
+        pts = xyz
+
+    xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
+
+    eyes = np.asarray([p["eye"] for p in poses], dtype=np.float32)      # [T,3]
+    centers = np.asarray([p["center"] for p in poses], dtype=np.float32)  # [T,3]
+
+    cam_x = eyes[:, 0]
+    cam_y = eyes[:, 1]
+    cam_z = eyes[:, 2]
+
+    # Forward vectors
+    fwd = centers - eyes
+    norms = np.linalg.norm(fwd, axis=1, keepdims=True) + 1e-8
+    fwd_norm = fwd / norms
+
+    # Arrow length as fraction of scene diagonal
+    bbox_min = xyz.min(axis=0)
+    bbox_max = xyz.max(axis=0)
+    diag = float(np.linalg.norm(bbox_max - bbox_min)) + 1e-6
+    arrow_len = 0.1 * diag
+
+    logger.info(
+        "[PLOT-3D] Plotting 3D camera path with %d poses, arrow_stride=%d",
+        len(poses),
+        arrow_stride,
+    )
+
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Scene scatter (light)
+    ax.scatter(
+        xs,
+        ys,
+        zs,
+        s=1,
+        c=zs,
+        cmap="gray",
+        alpha=0.3,
+    )
+
+    # Camera path
+    ax.plot(
+        cam_x,
+        cam_y,
+        cam_z,
+        color="red",
+        linewidth=2.0,
+        label="camera path",
+    )
+
+    # Arrows for view direction (subsampled)
+    idxs = np.arange(0, len(poses), max(1, arrow_stride))
+    ax.quiver(
+        cam_x[idxs],
+        cam_y[idxs],
+        cam_z[idxs],
+        fwd_norm[idxs, 0] * arrow_len,
+        fwd_norm[idxs, 1] * arrow_len,
+        fwd_norm[idxs, 2] * arrow_len,
+        length=1.0,
+        normalize=False,
+        color="cyan",
+    )
+
+    # Mark start / end
+    ax.scatter(cam_x[0], cam_y[0], cam_z[0], c="green", s=40, marker="o", label="start")
+    ax.scatter(
+        cam_x[-1],
+        cam_y[-1],
+        cam_z[-1],
+        c="magenta",
+        s=40,
+        marker="x",
+        label="end",
+    )
+
+    ax.set_title("Camera path in 3D")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.legend(loc="upper right")
+    ax.view_init(elev=25.0, azim=60.0)
+    fig.tight_layout()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+    logger.info("[PLOT-3D] Saved 3D camera path plot: %s", out_path)
+
 
 # ---------------------------------------------------------------------
 # CLI / main
@@ -331,7 +690,7 @@ def save_y_slices_xz(
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Research / analysis of 3DGS scene (.ply): "
-                    "densities, slices, orientation stats.",
+        "densities, slices, orientation stats, optional 3D views.",
     )
     ap.add_argument(
         "--scene",
@@ -352,7 +711,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--grid-res",
         type=int,
-        default=256,
+        default=512,
         help="Resolution of 2D grids (density maps, slices).",
     )
     ap.add_argument(
@@ -370,12 +729,16 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Number of Y-slices to generate.",
     )
-
     ap.add_argument(
         "--angle-bins",
         type=int,
         default=180,
         help="Number of bins for orientation histograms.",
+    )
+    ap.add_argument(
+        "--plot-3d",
+        action="store_true",
+        help="Also generate coarse 3D views of scene and camera path (if path is provided).",
     )
     return ap.parse_args()
 
@@ -397,7 +760,7 @@ def main() -> None:
     logger.info("[MAIN] Scene: %s", args.scene)
     logger.info("[MAIN] Outdir: %s", outdir)
 
-    # 1) Загрузка сцены
+    # 1) Load scene
     gauss = load_gaussians_from_ply(args.scene, max_points=args.max_splats)
     xyz = gauss.means
 
@@ -413,7 +776,7 @@ def main() -> None:
         diag,
     )
 
-    # 2) 1D гистограммы по координатам
+    # 2) 1D histograms of coordinates
     save_histogram(
         xyz[:, 0],
         outdir / "hist_x.png",
@@ -433,7 +796,7 @@ def main() -> None:
         xlabel="Z",
     )
 
-    # 3) Глобальная XZ карта плотности (вид сверху)
+    # 3) Global XZ density map (top-down)
     save_density_xz(
         xyz,
         outdir / "density_xz.png",
@@ -441,9 +804,8 @@ def main() -> None:
         title="XZ density (top-down view)",
     )
 
-    # 4) Y-срезы в XZ (поиск пола/потолка/слоёв)
+    # 4) Y-slices projected to XZ (floor / ceiling / layers)
     slices_dir = outdir / "slices_y_xz"
-    slices_dir.mkdir(parents=True, exist_ok=True)
     save_y_slices_xz(
         xyz,
         slices_dir,
@@ -452,8 +814,7 @@ def main() -> None:
         num_slices=args.num_slices,
     )
 
-
-    # 5) Ориентации (кватернионы -> направление локальной оси Z -> углы)
+    # 5) Orientation stats (quaternions -> forward axis -> angles)
     dirs = quat_forward_axis_wxyz(gauss.quats)
     azimuth_deg, elevation_deg = forward_angles_y_up(dirs)
 
@@ -469,130 +830,25 @@ def main() -> None:
         outdir / "orient_elevation_deg.png",
         title="Forward elevation (deg, vs XZ plane)",
         xlabel="elevation (deg, -90..90)",
-        bins=args.angle_bins // 2,
+        bins=max(1, args.angle_bins // 2),
     )
+
+    # 6) Optional coarse 3D views
+    if args.plot_3d:
+        save_scene_points_3d(
+            xyz,
+            outdir / "scene_points_3d.png",
+            max_points=100_000,
+        )
+        # 3D camera path is only meaningful if you call save_camera_path_3d
+        # from the main cinematic pipeline with actual poses.
+        logger.info(
+            "[MAIN] 3D scene points saved; camera path 3D plot should be "
+            "called from your main pipeline using save_camera_path_3d()."
+        )
 
     logger.info("[MAIN] Analysis finished. Outputs in: %s", outdir)
 
 
 if __name__ == "__main__":
     main()
-
-
-def save_camera_path_on_density_xz(
-    means: np.ndarray,
-    poses: List[Dict[str, Any]],
-    out_path: Path,
-    grid_res: int = 256,
-    arrow_stride: int = 10,
-) -> None:
-    """
-    Рисует маршрут камеры и направление взгляда на XZ-карте плотности сцены.
-
-    Допущения:
-      - Верхняя ось мира: Y.
-      - Камера ходит по XZ, eye = [x, y, z].
-      - Плотность строится по проекции всех гауссиан на XZ.
-
-    Args:
-        means: (N,3) координаты гауссиан.
-        poses: список словарей с ключами "eye" и "center"
-               (как в твоём camera_path.json / generate_camera_poses_*).
-        out_path: путь до PNG, куда сохранить картинку.
-        grid_res: разрешение карты плотности (grid_res x grid_res).
-        arrow_stride: как часто рисовать стрелки направления (каждый k-й кадр).
-    """
-    _ensure_matplotlib()
-
-    xyz = np.asarray(means, dtype=np.float32)
-    x = xyz[:, 0]
-    z = xyz[:, 2]
-
-    x_min, x_max = float(x.min()), float(x.max())
-    z_min, z_max = float(z.min()), float(z.max())
-
-    # --- карта плотности по XZ ---
-    H, _, _ = np.histogram2d(
-        x,
-        z,
-        bins=grid_res,
-        range=[[x_min, x_max], [z_min, z_max]],
-    )  # [grid_res, grid_res]
-
-    # --- траектория камеры ---
-    if not poses:
-        logger.warning("[CAM-PATH] No poses provided, skipping camera path plot.")
-        return
-
-    eyes = np.asarray([p["eye"] for p in poses], dtype=np.float32)  # [T,3]
-    centers = np.asarray([p["center"] for p in poses], dtype=np.float32)  # [T,3]
-
-    cam_x = eyes[:, 0]
-    cam_z = eyes[:, 2]
-
-    # направления взгляда в XZ
-    dir_x = centers[:, 0] - eyes[:, 0]
-    dir_z = centers[:, 2] - eyes[:, 2]
-    dirs = np.stack([dir_x, dir_z], axis=1)
-    norms = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-8
-    dirs_norm = dirs / norms  # единичные векторы в XZ
-
-    # масштаб стрелок относительно размера сцены
-    x_span = max(1e-6, x_max - x_min)
-    z_span = max(1e-6, z_max - z_min)
-    arrow_len = 0.05 * max(x_span, z_span)  # 5% размера сцены
-
-    logger.info(
-        "[CAM-PATH] Plotting %d poses on XZ density (grid_res=%d), arrow_stride=%d",
-        len(poses),
-        grid_res,
-        arrow_stride,
-    )
-
-    # --- рисуем ---
-    fig, ax = plt.subplots(figsize=(7, 7))
-
-    # плотность
-    im = ax.imshow(
-        H.T,
-        origin="lower",
-        extent=[x_min, x_max, z_min, z_max],
-        aspect="equal",
-        cmap="gray",
-    )
-    fig.colorbar(im, ax=ax, label="point density")
-
-    # маршрут
-    ax.plot(cam_x, cam_z, "r-", linewidth=2.0, label="camera path")
-
-    # рисуем стрелки через stride, чтобы не захламлять
-    idxs = np.arange(0, len(poses), max(1, arrow_stride))
-    ax.quiver(
-        cam_x[idxs],
-        cam_z[idxs],
-        dirs_norm[idxs, 0] * arrow_len,
-        dirs_norm[idxs, 1] * arrow_len,
-        angles="xy",
-        scale_units="xy",
-        scale=1.0,
-        color="cyan",
-        width=0.003,
-        label="view direction (sampled)",
-    )
-
-    # отметим старт/финиш
-    ax.scatter(cam_x[0], cam_z[0], c="green", s=60, marker="o", label="start")
-    ax.scatter(cam_x[-1], cam_z[-1], c="magenta", s=60, marker="x", label="end")
-
-    ax.set_title("Camera path & view direction on XZ density")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Z")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.2)
-
-    fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-    logger.info("[CAM-PATH] Saved camera path plot: %s", out_path)

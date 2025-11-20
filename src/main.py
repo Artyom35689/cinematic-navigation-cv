@@ -30,7 +30,7 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 from .analysis.research_scene import save_camera_path_on_density_xz
-from .gsplat_scene import load_gaussians_from_ply, generate_camera_poses_straight_path, generate_camera_poses_spline
+from src.gsplat_scene import generate_camera_poses_spline, generate_camera_poses_straight_path,load_gaussians_from_ply 
 from .render_utils import render_gsplat_to_video_streaming
 
 
@@ -142,25 +142,44 @@ def main() -> None:
     gauss = load_gaussians_from_ply(str(scene_path), max_points=args.max_splats)
 
     # Camera poses: прямой путь по XZ через заданные точки
-    waypoints_xz = [
-        [28.0, 30.0],
-        [20.0, 22.0],
-        [10.0, 24.0],
-        [0.0,24.0],
-        [0.0,-5.0],
-        [2.0,-5.0],
-        [2.0,0.0],
-        [5.1,0.0],
-        [5.1,25.0],
+    path_with_behaviors = [
+        # сегмент 0: [28,30] -> [20,22], без спец. поведения
+        ([28.0, 30.0], None),
+
+        # сегмент 1: [20,22] -> [10,24], поворачиваем взгляд к точке
+        ([20.0, 22.0], {
+            "mode": "look_at_point",
+            "target": [15.0, 5.0, 20.0],
+            "strength": 1.0,
+        }),
+
+        # сегмент 2: [10,24] -> [0,24], вертикальная дуга (под потолком)
+        ([10.0, 24.0], {
+            "mode": "height_arc",
+            "height_offset_fraction": 0.01,  # 0.2 * diag вверх в центре сегмента
+        }),
+
+        # сегмент 3: [0,24] -> [0,-5], доп. поворот камеры
+        ([0.0, 24.0], {
+            "mode": "extra_yaw",
+            "angle_deg": 360.0,  # полная "закрутка" взгляда в середине сегмента
+        }),
+
+        # остальные сегменты без поведения (будет default)
+        ([0.0, -5.0], None),
+        ([2.0, -5.0], None),
+        ([2.0, 0.0], None),
+        ([5.1, 0.0], None),
+        ([5.1, 25.0], None),  # поведение для последней точки игнорируется
     ]
 
     poses = generate_camera_poses_spline(
-        gauss.means,
+        means=gauss.means,
         num_frames=num_frames,
-        waypoints_xz=waypoints_xz,
-        height_fraction=0.0,      # можно поднять, например 0.1
-        lookahead_fraction=0.05,  # как далеко вперёд по пути смотрим
-        samples_per_segment=64,   # при необходимости можно увеличить
+        path_with_behaviors=path_with_behaviors,
+        height_fraction=0.0,
+        lookahead_fraction=0.05,
+        samples_per_segment=64,
     )
     cam_path_plot = outdir / "camera_path_on_density_xz.png"
     save_camera_path_on_density_xz(
@@ -222,7 +241,7 @@ def main() -> None:
         "frames": meta_frames,
         "render_backend": "gsplat_rgb",
         "path_type": "straight_polyline_xz",
-        "waypoints_xz": waypoints_xz,
+        
     }
     with cam_json.open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

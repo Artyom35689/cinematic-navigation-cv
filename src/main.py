@@ -80,16 +80,16 @@ SCENE_CONFIG_CONF_HALL: Dict[str, Any] = {
 
         # segment 3: [0,24] -> [0,-5], extra yaw twist along the segment
         {
-            "waypoint": [0.0, 24.0],
+            "waypoint": [0.0, 23.0],
             "behavior": {
                 "mode": "extra_yaw",
-                "angle_deg": -100.0,  # full spin over the segment
+                "angle_deg": -180.0,  # full spin over the segment
             },
         },
 
         # remaining segments with default behavior
-        {"waypoint": [0.0, -5.0], "behavior": None},
-        {"waypoint": [2.0, -5.0], "behavior": None},
+        {"waypoint": [0.0, -3.0], "behavior": None},
+        {"waypoint": [2.0, -3.0], "behavior": None},
         {"waypoint": [2.0, 0.0], "behavior": None},
         {"waypoint": [5.1, 0.0], "behavior": None},
         {"waypoint": [5.1, 25.0], "behavior": None},  # behavior for last waypoint ignored
@@ -99,10 +99,10 @@ SCENE_CONFIG_CONF_HALL: Dict[str, Any] = {
     "straight_path_waypoints_xz": [
         [28.0, 30.0],
         [20.0, 22.0],
-        [10.0, 24.0],
-        [0.0, 24.0],
-        [0.0, -5.0],
-        [2.0, -5.0],
+        [10.0, 22.0],
+        [0.0, 22.0],
+        [0.0, -3.0],
+        [2.0, -3.0],
         [2.0, 0.0],
         [5.1, 0.0],
         [5.1, 25.0],
@@ -113,7 +113,7 @@ SCENE_CONFIG_CONF_HALL: Dict[str, Any] = {
 GLOBAL_CONFIG: Dict[str, Any] = {
     "outdir": "output/ConferenceHall_demo",
     "seconds": 60.0,
-    "fps": 10,
+    "fps": 60,
     "fov_deg": 75.0,
     "resolution": [1280, 720],  # [width, height]
     "max_splats": 20_000_000,
@@ -439,7 +439,12 @@ def main(
     logger.info("[MAIN] Using device: %s", device)
 
     # ------------------------------------------------------------------
-    # 4) Render + stream to video (and optional YOLO)
+    # 4) Optional scene analysis (histograms, slices, orientations)
+    # ------------------------------------------------------------------
+    _maybe_run_scene_analysis(gauss, scene_path, outdir, global_cfg)
+
+    # ------------------------------------------------------------------
+    # 5) Render + stream to video (and optional YOLO)
     # ------------------------------------------------------------------
     out_mp4 = outdir / "panorama_tour.mp4"
 
@@ -465,7 +470,7 @@ def main(
     logger.info("[MAIN] Video written: %s", out_mp4)
 
     # ------------------------------------------------------------------
-    # 5) Camera path JSON meta
+    # 6) Camera path JSON meta
     # ------------------------------------------------------------------
     cam_json = outdir / "camera_path.json"
     meta_frames: List[Dict[str, Any]] = []
@@ -494,7 +499,7 @@ def main(
     logger.info("[MAIN] Camera path JSON written: %s", cam_json)
 
     # ------------------------------------------------------------------
-    # 6) Optional YOLO detections JSON (already computed during rendering)
+    # 7 Optional YOLO detections JSON (already computed during rendering)
     # ------------------------------------------------------------------
     if detect and dets is not None:
         det_json = outdir / "detections_yolo.json"
@@ -502,13 +507,7 @@ def main(
             json.dump({"detections": dets}, f, indent=2)
         logger.info("[MAIN] YOLO detections JSON written: %s", det_json)
 
-    # ------------------------------------------------------------------
-    # 7) Optional scene analysis (histograms, slices, orientations)
-    # ------------------------------------------------------------------
-    _maybe_run_scene_analysis(gauss, scene_path, outdir, global_cfg)
-
     logger.info("[MAIN] Done.")
-
 
 if __name__ == "__main__":
     main()

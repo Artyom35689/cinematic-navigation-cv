@@ -29,8 +29,8 @@ from typing import Any, Dict, List
 
 import numpy as np
 import torch
-
-from .gsplat_scene import load_gaussians_from_ply, generate_camera_poses_straight_path
+from .analysis.research_scene import save_camera_path_on_density_xz
+from .gsplat_scene import load_gaussians_from_ply, generate_camera_poses_straight_path, generate_camera_poses_spline
 from .render_utils import render_gsplat_to_video_streaming
 
 
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--seconds",
         type=float,
-        default=35.0,
+        default=30.0,
         help="Duration of the fly-through in seconds.",
     )
     p.add_argument(
@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--fov",
         type=float,
-        default=70.0,
+        default=80.0,
         help="Horizontal field of view in degrees.",
     )
     p.add_argument(
@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--detect",
         action="store_true",
-        default=True,
+        default=False,
         help="Run YOLO detection on rendered frames.",
     )
     p.add_argument(
@@ -145,15 +145,30 @@ def main() -> None:
     waypoints_xz = [
         [28.0, 30.0],
         [20.0, 22.0],
-        [10.0, 25.0],
+        [10.0, 24.0],
+        [0.0,24.0],
+        [0.0,-5.0],
+        [2.0,-5.0],
+        [2.0,0.0],
+        [5.1,0.0],
+        [5.1,25.0],
     ]
 
-    poses = generate_camera_poses_straight_path(
+    poses = generate_camera_poses_spline(
         gauss.means,
-        num_frames,
+        num_frames=num_frames,
         waypoints_xz=waypoints_xz,
-        height_fraction=0.0,      # при необходимости можно поднять камеру
-        lookahead_fraction=0.05,  # насколько далеко вперёд по пути смотрим
+        height_fraction=0.0,      # можно поднять, например 0.1
+        lookahead_fraction=0.05,  # как далеко вперёд по пути смотрим
+        samples_per_segment=64,   # при необходимости можно увеличить
+    )
+    cam_path_plot = outdir / "camera_path_on_density_xz.png"
+    save_camera_path_on_density_xz(
+        gauss.means,   # или scene.gaussians.means, если работаешь с классом
+        poses,
+        cam_path_plot,
+        grid_res=256,
+        arrow_stride=10,
     )
 
     # Device

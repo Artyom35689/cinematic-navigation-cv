@@ -383,6 +383,212 @@ def generate_camera_poses_straight_path(
     )
     return poses
 
+import logging
+from typing import Any, Dict, List
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def generate_camera_poses_spline(
+    means: np.ndarray,
+    num_frames: int,
+    waypoints_xz: List[List[float]] | np.ndarray,
+    height_fraction: float = 0.0,
+    lookahead_fraction: float = 0.05,
+    samples_per_segment: int = 64,
+) -> List[Dict[str, Any]]:
+    """
+    Generate camera poses along a Catmull-Rom spline in the XZ plane.
+
+    - World up axis: Y
+    - Camera moves in XZ through given waypoints: [(x0, z0), (x1, z1), ...]
+    - Camera height (Y) is constant and derived from scene bbox.
+    - Path is *smooth* (Catmull-Rom spline), not piecewise linear.
+    - Speed is approximately constant via arc-length parameterization.
+    - Camera looks forward along the spline (look-ahead), giving smooth rotation.
+
+    Args:
+        means: (N,3) Gaussian means, used only to estimate bbox/height.
+        num_frames: total frames to generate.
+        waypoints_xz: list/array of [x, z] waypoints in world coordinates (XZ plane).
+        height_fraction: camera Y offset as fraction of scene diagonal.
+                         0.0 -> на уровне центра по Y, >0 -> выше.
+        lookahead_fraction: how far ahead along the total path (in [0, 1]) to look.
+                            0.05 -> смотрим вперёд на 5% длины пути.
+        samples_per_segment: number of samples per spline segment when building
+                             arc-length table (больше -> ровнее скорость, но дольше).
+
+    Returns:
+        List of dicts {"view": 4x4, "eye": [3], "center": [3]}.
+    """
+    waypoints_xz = np.asarray(waypoints_xz, dtype=np.float32)  # [M,2]
+    if waypoints_xz.shape[0] < 2:
+        raise ValueError("Need at least two waypoints for spline path")
+
+    # --- Scene bbox / camera height ---
+    bbox_min = means.min(axis=0)
+    bbox_max = means.max(axis=0)
+    center = 0.5 * (bbox_min + bbox_max)
+    diag = float(np.linalg.norm(bbox_max - bbox_min)) + 1e-6
+
+    center_y = float(center[1])
+    cam_y = center_y + height_fraction * diag
+
+    logger.info(
+        "[PATH/SPLINE] bbox_min=%s bbox_max=%s diag=%.3f cam_y=%.3f",
+        np.round(bbox_min, 3),
+        np.round(bbox_max, 3),
+        diag,
+        cam_y,
+    )
+
+    # --- Catmull-Rom helpers ---
+
+    pts = waypoints_xz  # [M,2]
+    M = pts.shape[0]
+    n_segments = M - 1
+
+    def get_ctrl(idx: int) -> np.ndarray:
+        """Clamp индекс к [0, M-1] и вернуть соответствующую точку [2]."""
+        idx = max(0, min(idx, M - 1))
+        return pts[idx]
+
+    def catmull_rom_segment(seg_idx: int, t: float) -> np.ndarray:
+        """
+        Catmull-Rom (centripetal/uniform классический) позиция на сегменте seg_idx в [0,1].
+
+        p0--p1--p2--p3, сегмент от p1 к p2.
+        """
+        p0 = get_ctrl(seg_idx - 1)
+        p1 = get_ctrl(seg_idx)
+        p2 = get_ctrl(seg_idx + 1)
+        p3 = get_ctrl(seg_idx + 2)
+
+        t2 = t * t
+        t3 = t2 * t
+        # классическая формула CR-сплайна с tau=0.5, но в матричном виде
+        # здесь используется “uniform” вариант:
+        # 0.5 * ((2*p1) + (-p0 + p2)*t + (2*p0 -5*p1 +4*p2 - p3)*t^2 + (-p0 +3*p1 -3*p2 + p3)*t^3)
+        return 0.5 * (
+            (2.0 * p1)
+            + (-p0 + p2) * t
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+        )
+
+    # --- Arc-length sampling (примерно постоянная скорость) ---
+
+    if samples_per_segment < 2:
+        samples_per_segment = 2
+
+    # параметр s_global идёт от 0 до n_segments, каждый сегмент — [k, k+1]
+    total_samples = n_segments * samples_per_segment + 1
+    sample_s = np.linspace(0.0, float(n_segments), total_samples, dtype=np.float32)
+
+    sample_pos = np.zeros((total_samples, 2), dtype=np.float32)
+    for idx, s in enumerate(sample_s):
+        seg_idx = int(np.clip(np.floor(s), 0, n_segments - 1))
+        t_local = float(s - seg_idx)
+        sample_pos[idx] = catmull_rom_segment(seg_idx, t_local)
+
+    # длины по дуге
+    seg_vecs = sample_pos[1:] - sample_pos[:-1]
+    seg_len = np.linalg.norm(seg_vecs, axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg_len)])  # [total_samples]
+    total_len = float(arc[-1]) + 1e-9  # защитимся от нуля
+
+    logger.info(
+        "[PATH/SPLINE] n_segments=%d, samples=%d, total_len=%.3f",
+        n_segments,
+        total_samples,
+        total_len,
+    )
+
+    def s_from_arc(target_len: float) -> float:
+        """
+        Обратное преобразование: arc length -> параметр s_global (0..n_segments).
+        Линейная интерполяция между ближайшими сэмплами.
+        """
+        target_len = np.clip(target_len, 0.0, total_len)
+        k = int(np.searchsorted(arc, target_len, side="right"))
+        if k <= 0:
+            return float(sample_s[0])
+        if k >= len(arc):
+            return float(sample_s[-1])
+
+        l0 = arc[k - 1]
+        l1 = arc[k]
+        s0 = sample_s[k - 1]
+        s1 = sample_s[k]
+
+        if l1 <= l0 + 1e-9:
+            return float(s0)
+
+        alpha = float((target_len - l0) / (l1 - l0))
+        return float(s0 + alpha * (s1 - s0))
+
+    def pos_from_arc(target_len: float) -> np.ndarray:
+        s = s_from_arc(target_len)
+        seg_idx = int(np.clip(np.floor(s), 0, n_segments - 1))
+        t_local = float(s - seg_idx)
+        return catmull_rom_segment(seg_idx, t_local)
+
+    # --- Генерация поз ---
+
+    poses: List[Dict[str, Any]] = []
+    if num_frames <= 1:
+        # Один кадр: ставим камеру в начало пути и смотрим в сторону второй точки
+        p0 = pos_from_arc(0.0)
+        p1 = pos_from_arc(min(0.05 * total_len, total_len))
+        eye = np.array([p0[0], cam_y, p0[1]], dtype=np.float32)
+        tgt = np.array([p1[0], cam_y, p1[1]], dtype=np.float32)
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        view = look_at(eye, tgt, up)
+        poses.append(
+            {
+                "view": view,
+                "eye": eye.tolist(),
+                "center": tgt.tolist(),
+            }
+        )
+        logger.info("[PATH/SPLINE] Generated single-frame pose.")
+        return poses
+
+    lookahead_len = float(lookahead_fraction) * total_len
+
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    for i in range(num_frames):
+        t = i / float(num_frames - 1)
+        cur_len = t * total_len
+        ahead_len = min(cur_len + lookahead_len, total_len)
+
+        p_cur = pos_from_arc(cur_len)   # [x,z]
+        p_ahead = pos_from_arc(ahead_len)
+
+        eye = np.array([p_cur[0], cam_y, p_cur[1]], dtype=np.float32)
+        tgt = np.array([p_ahead[0], cam_y, p_ahead[1]], dtype=np.float32)
+
+        view = look_at(eye, tgt, up)
+
+        poses.append(
+            {
+                "view": view,
+                "eye": eye.tolist(),
+                "center": tgt.tolist(),
+            }
+        )
+
+    logger.info(
+        "[PATH/SPLINE] Generated %d poses along spline through %d waypoints",
+        len(poses),
+        waypoints_xz.shape[0],
+    )
+    return poses
+
+
 
 def generate_camera_poses(
     means: np.ndarray,

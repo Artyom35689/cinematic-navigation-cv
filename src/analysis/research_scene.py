@@ -136,7 +136,7 @@ def save_histogram(
     _ensure_matplotlib()
     data = np.asarray(data, dtype=np.float32)
 
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(16, 9))
     ax.hist(data, bins=bins, alpha=0.8)
     ax.set_title(title)
     ax.set_xlabel(xlabel)
@@ -180,7 +180,7 @@ def save_density_xz(
         range=[[x_min, x_max], [z_min, z_max]],
     )  # [grid_res, grid_res]
 
-    fig, ax = plt.subplots(figsize=(6, 6))
+    fig, ax = plt.subplots(figsize=(16, 9))
     im = ax.imshow(
         H.T,
         origin="lower",
@@ -314,7 +314,7 @@ def save_y_slices_xz(
             range=[[x_min, x_max], [z_min, z_max]],
         )
 
-        fig, ax = plt.subplots(figsize=(6, 6))
+        fig, ax = plt.subplots(figsize=(16, 9))
         im = ax.imshow(
             H.T,
             origin="lower",
@@ -423,7 +423,7 @@ def save_camera_path_on_density_xz(
         arrow_stride,
     )
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=(16, 9))
 
     # Density background
     im = ax.imshow(
@@ -523,7 +523,7 @@ def save_scene_points_3d(
 
     xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
 
-    fig = plt.figure(figsize=(7, 6))
+    fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(111, projection="3d")
 
     ax.scatter(
@@ -617,7 +617,7 @@ def save_camera_path_3d(
         arrow_stride,
     )
 
-    fig = plt.figure(figsize=(8, 7))
+    fig = plt.figure(figsize=(16, 9))
     ax = fig.add_subplot(111, projection="3d")
 
     # Scene scatter (light)

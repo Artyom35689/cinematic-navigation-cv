@@ -113,13 +113,13 @@ SCENE_CONFIG_CONF_HALL: Dict[str, Any] = {
 GLOBAL_CONFIG: Dict[str, Any] = {
     "outdir": "output/ConferenceHall_demo",
     "seconds": 60.0,
-    "fps": 60,
+    "fps": 10,
     "fov_deg": 75.0,
     "resolution": [1280, 720],  # [width, height]
     "max_splats": 20_000_000,
-    "detect": False,
+    "detect": True,
     "yolo_model": "models/yolo12n.pt",
-    "yolo_conf": 0.5,
+    "yolo_conf": 0.65,
     "draw_boxes": True,  # draw YOLO boxes directly on frames when detect=True
 
     # Scene analysis: if True, in addition to video we generate analysis plots.
@@ -456,7 +456,11 @@ def main(
         detect=detect,
         yolo_model_path=yolo_model,
         yolo_conf=yolo_conf,
-        draw_boxes=(detect and draw_boxes),
+        draw_boxes=draw_boxes,
+        revisit_top_k=5,              # например, вернуться к 5 объектам
+        revisit_min_world_dist=2.5,   # минимальная дистанция между объектами в мире
+        revisit_stop_seconds=0.5,
+        revisit_interp_seconds=1.0,
     )
     logger.info("[MAIN] Video written: %s", out_mp4)
 

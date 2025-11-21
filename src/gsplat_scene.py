@@ -697,6 +697,265 @@ def generate_camera_poses_straight_path(
     )
     return poses
 
+import logging
+from typing import List, Dict, Any
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# предполагается, что в этом же модуле уже есть:
+# from .gsplat_scene import look_at, _normalize
+
+def generate_camera_poses_straight_path_3d(
+    means: np.ndarray,
+    waypoints_xyz: List[List[float]] | np.ndarray,
+    num_frames: int,
+    patch_size: float,
+    start_cam_y: float | None = None,
+    floor_percentile: float = 5.0,
+    lookahead_fraction: float = 0.05,
+) -> List[Dict[str, Any]]:
+    """
+    3D camera path with 2D planning in XZ and local-height adaptation.
+
+    - World up axis: Y.
+    - Path planning is done in XZ using waypoints' (x,z) only.
+    - Under each camera position we analyze a K×K patch in XZ
+      and estimate local "floor" height by percentile of Y.
+    - The camera is kept at a constant offset above the local floor,
+      where this offset is fixed from the *first* position so that:
+          cam_y(0) = start_cam_y
+          cam_y(t) = local_floor_y(t) + offset
+
+    Args:
+        means:
+            (N,3) Gaussian means in world coordinates.
+        waypoints_xyz:
+            list/array of [x, y, z] (we use x,z for path; y[0] как стартовая высота,
+            если start_cam_y == None).
+        num_frames:
+            total number of frames (> 0).
+        patch_size:
+            size of the XZ patch (side length, in world units) under the camera.
+            The patch is a square:
+                x ∈ [x_c - patch_size/2, x_c + patch_size/2]
+                z ∈ [z_c - patch_size/2, z_c + patch_size/2]
+        start_cam_y:
+            desired camera Y at the first frame.
+            If None -> take from waypoints_xyz[0,1].
+        floor_percentile:
+            which percentile of Y inside patch to treat as "floor" (e.g. 5.0).
+        lookahead_fraction:
+            fraction of total path length used as look-ahead distance for
+            orientation in XZ.
+
+    Returns:
+        List of dicts:
+            {
+              "view": 4x4 (numpy float32),
+              "eye": [x,y,z],
+              "center": [x,y,z],
+            }
+    """
+    means = np.asarray(means, dtype=np.float32)
+    if means.ndim != 2 or means.shape[1] != 3:
+        raise ValueError(f"means must have shape [N,3], got {means.shape}")
+
+    waypoints_xyz = np.asarray(waypoints_xyz, dtype=np.float32)
+    if waypoints_xyz.ndim != 2 or waypoints_xyz.shape[1] != 3:
+        raise ValueError(
+            f"waypoints_xyz must have shape [M,3], got {waypoints_xyz.shape}"
+        )
+    M = waypoints_xyz.shape[0]
+    if M < 2:
+        raise ValueError("Need at least two waypoints for a 3D straight path")
+    if num_frames <= 0:
+        raise ValueError("num_frames must be > 0")
+    if patch_size <= 0.0:
+        raise ValueError("patch_size must be > 0")
+
+    # 2D путь по XZ
+    waypoints_xz = waypoints_xyz[:, [0, 2]]  # [M,2]
+
+    # Стартовая высота камеры
+    if start_cam_y is None:
+        start_cam_y = float(waypoints_xyz[0, 1])
+    else:
+        start_cam_y = float(start_cam_y)
+
+    # Глобальный "пол" (на случай пустых патчей)
+    global_floor_y = float(np.percentile(means[:, 1], floor_percentile))
+
+    # ------------------------------------------------------------------
+    # Polyline in XZ (для позиции вдоль пути)
+    # ------------------------------------------------------------------
+    seg_vecs_xz = waypoints_xz[1:] - waypoints_xz[:-1]  # [M-1,2]
+    seg_lens = np.linalg.norm(seg_vecs_xz, axis=1)      # [M-1]
+    if np.any(seg_lens <= 0):
+        raise ValueError("Found zero-length segment in waypoints (XZ)")
+
+    cum_lens = np.concatenate([[0.0], np.cumsum(seg_lens)])  # [M]
+    total_len = float(cum_lens[-1])
+
+    bbox_min = waypoints_xz.min(axis=0)
+    bbox_max = waypoints_xz.max(axis=0)
+    diag_xz = float(np.linalg.norm(bbox_max - bbox_min)) + 1e-6
+
+    logger.info(
+        "[PATH/STRAIGHT_3D] total_len=%.3f, num_segments=%d, num_frames=%d, diag_xz=%.3f",
+        total_len,
+        len(seg_lens),
+        num_frames,
+        diag_xz,
+    )
+
+    half_patch = float(patch_size) * 0.5
+
+    def _local_floor_height(x_c: float, z_c: float) -> float:
+        """
+        Estimate local floor height under camera at (x_c, z_c) using
+        K×K patch in XZ and percentile of Y.
+        """
+        x = means[:, 0]
+        z = means[:, 2]
+        mask = (
+            (x >= x_c - half_patch)
+            & (x <= x_c + half_patch)
+            & (z >= z_c - half_patch)
+            & (z <= z_c + half_patch)
+        )
+        ys = means[mask, 1]
+        if ys.size == 0:
+            # fallback: глобальный пол
+            return global_floor_y
+        return float(np.percentile(ys, floor_percentile))
+
+    def _point_on_polyline_xz(s: float) -> np.ndarray:
+        """
+        Return (x,z) point at arc length s along XZ polyline.
+        """
+        if total_len <= 0.0:
+            return waypoints_xz[0].copy()
+
+        s = float(np.clip(s, 0.0, total_len))
+        j = int(np.searchsorted(cum_lens, s, side="right") - 1)
+        j = max(0, min(j, len(seg_lens) - 1))
+
+        s0 = float(cum_lens[j])
+        seg_len = float(seg_lens[j])
+        if seg_len <= 0.0:
+            return waypoints_xz[j].copy()
+
+        u_local = (s - s0) / seg_len
+        u_local = float(np.clip(u_local, 0.0, 1.0))
+
+        p0 = waypoints_xz[j]
+        p1 = waypoints_xz[j + 1]
+        return p0 * (1.0 - u_local) + p1 * u_local
+
+    # ------------------------------------------------------------------
+    # Высота камеры: фиксируем offset относительно локального пола
+    # ------------------------------------------------------------------
+    # пол под стартовой точкой
+    x0, z0 = waypoints_xz[0]
+    local_floor_y0 = _local_floor_height(float(x0), float(z0))
+    height_offset = start_cam_y - local_floor_y0  # одна и та же над полом вдоль маршрута
+
+    logger.info(
+        "[PATH/STRAIGHT_3D] start_cam_y=%.3f, local_floor_y0=%.3f, height_offset=%.3f",
+        start_cam_y,
+        local_floor_y0,
+        height_offset,
+    )
+
+    # ------------------------------------------------------------------
+    # Генерация поз
+    # ------------------------------------------------------------------
+    poses: List[Dict[str, Any]] = []
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    if num_frames == 1:
+        # Один кадр: ставим в начало пути, смотрим вдоль пути (по XZ)
+        xz0 = _point_on_polyline_xz(0.0)
+        floor0 = _local_floor_height(float(xz0[0]), float(xz0[1]))
+        cam_y0 = floor0 + height_offset
+
+        if total_len > 0.0:
+            xz1 = _point_on_polyline_xz(min(0.05 * total_len, total_len))
+        else:
+            xz1 = xz0 + np.array([0.0, 1.0], dtype=np.float32)
+
+        eye = np.array([xz0[0], cam_y0, xz0[1]], dtype=np.float32)
+        center = np.array([xz1[0], cam_y0, xz1[1]], dtype=np.float32)
+
+        forward = _normalize(center - eye)
+        center = eye + forward  # нормируем, чтобы не было артефактов
+        view = look_at(eye, center, up)
+
+        poses.append(
+            {
+                "view": view,
+                "eye": eye.astype(np.float32).tolist(),
+                "center": center.astype(np.float32).tolist(),
+            }
+        )
+        logger.info("[PATH/STRAIGHT_3D] Generated single-frame pose.")
+        return poses
+
+    lookahead_dist = float(lookahead_fraction) * total_len
+    if lookahead_dist <= 0.0:
+        lookahead_dist = 1e-6
+
+    for i in range(num_frames):
+        t = i / float(num_frames - 1)
+        s = t * total_len
+        s_ahead = min(s + lookahead_dist, total_len)
+
+        xz_cur = _point_on_polyline_xz(s)
+        xz_ahead = _point_on_polyline_xz(s_ahead)
+
+        # Локальный пол под текущей позой
+        floor_y = _local_floor_height(float(xz_cur[0]), float(xz_cur[1]))
+        cam_y = floor_y + height_offset
+
+        eye = np.array([xz_cur[0], cam_y, xz_cur[1]], dtype=np.float32)
+
+        # Взгляд вдоль XZ-пути, без наклона по вертикали (камера "горизонтальна")
+        dir_xz = xz_ahead - xz_cur
+        if np.linalg.norm(dir_xz) < 1e-8 and s > 0.0:
+            # если в конец упёрлись — смотрим немного назад
+            xz_back = _point_on_polyline_xz(max(0.0, s - lookahead_dist))
+            dir_xz = xz_back - xz_cur
+
+        if np.linalg.norm(dir_xz) < 1e-8:
+            forward = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        else:
+            dir_xz_n = dir_xz / np.linalg.norm(dir_xz)
+            forward = np.array([dir_xz_n[0], 0.0, dir_xz_n[1]], dtype=np.float32)
+
+        center = eye + forward  # единичный шаг вперёд
+
+        view = look_at(eye, center, up)
+
+        poses.append(
+            {
+                "view": view,
+                "eye": eye.astype(np.float32).tolist(),
+                "center": center.astype(np.float32).tolist(),
+            }
+        )
+
+    logger.info(
+        "[PATH/STRAIGHT_3D] Generated %d poses along XZ polyline through %d waypoints; "
+        "patch_size=%.3f, floor_percentile=%.1f",
+        len(poses),
+        waypoints_xz.shape[0],
+        patch_size,
+        floor_percentile,
+    )
+    return poses
+
+
 
 def generate_camera_poses_spline(
     means: np.ndarray,

@@ -4,7 +4,9 @@
 Cinematic navigation pipeline (config-driven):
 
   - load unpacked 3DGS PLY into GaussiansNP
-  - generate camera path in XZ plane (Y up) using configured waypoints + behaviors
+  - generate camera path:
+      * "spline": XZ plane, Y up, waypoints + per-segment behaviors
+      * "straight": full 3D polyline, camera height from waypoints
   - render frames with gsplat and stream directly into ffmpeg (MP4)
   - optionally run YOLO detection during rendering
   - optionally run scene analysis (histograms, slices, orientation, camera path plot)
@@ -16,6 +18,8 @@ Usage (default configs inside this file):
 If you want to customize behavior, edit GLOBAL_CONFIG and SCENE_CONFIG_CONF_HALL
 or call main(scene_cfg=..., global_cfg=...) from your own script.
 """
+
+#TODO: подумай над тем чтобы выдерживать высоту над поверхностью сцены при движении камеры по пути
 
 from __future__ import annotations
 
@@ -30,10 +34,12 @@ import torch
 from .gsplat_scene import (
     load_gaussians_from_ply,
     generate_camera_poses_spline,
-    generate_camera_poses_straight_path,
+    generate_camera_poses_straight_path_3d,
 )
 from .render_utils import render_gsplat_to_video_streaming
 from .analysis import research_scene as rs  # reuse analysis helpers
+from .analysis.scene_normalizer import normalize_scene_axes
+
 
 logger = logging.getLogger(__name__)
 
@@ -44,16 +50,26 @@ logger = logging.getLogger(__name__)
 
 # Scene config: only scene path + path definition/behavior.
 SCENE_CONFIG_CONF_HALL: Dict[str, Any] = {
-    "name": "ConferenceHall_demo",
-    "scene_path": "scenes/ConferenceHall.ply",
-    # Path type: "spline" or "straight"
-    "path_type": "spline",
-    # Waypoints + behaviors; behavior applies from this waypoint to the next.
-    # Behavior is optional (None) or a dict with a known "mode".
-    #
-    # NOTE:
+    "name": "outdoor-street",
+    "scene_path": "scenes/outdoor-street.ply",
+
+    "normalize_scene": True,
+    "normalization": {
+        # fraction of Y-range used as "floor" sample
+        "bottom_frac": 0.2,
+        # max number of points used to fit floor plane
+        "max_floor_points": 200_000,
+    },
+
+    # Path type:
+    #   - "spline": camera moves in XZ plane (waypoints [x, z] + behaviors)
+    #   - "straight": camera moves along full 3D polyline (waypoints [x, y, z])
+    "path_type": "straight",
+
+    # For "spline" path mode:
     #   - World up: Y
     #   - Camera moves in XZ plane (waypoint is [x, z]).
+    #   - Behavior applies from this waypoint to the next.
     "path_with_behaviors": [
         # segment 0: [28,30] -> [20,22], no special behavior
         {"waypoint": [28.0, 30.0], "behavior": None},
@@ -83,7 +99,7 @@ SCENE_CONFIG_CONF_HALL: Dict[str, Any] = {
             "waypoint": [0.0, 23.0],
             "behavior": {
                 "mode": "extra_yaw",
-                "angle_deg": -180.0,  # full spin over the segment
+                "angle_deg": -180.0,  # spin over the segment
             },
         },
 
@@ -94,30 +110,33 @@ SCENE_CONFIG_CONF_HALL: Dict[str, Any] = {
         {"waypoint": [5.1, 0.0], "behavior": None},
         {"waypoint": [5.1, 25.0], "behavior": None},  # behavior for last waypoint ignored
     ],
-    # For straight path mode (if you switch path_type="straight"),
-    # only waypoints_xz are used:
-    "straight_path_waypoints_xz": [
-        [28.0, 30.0],
-        [20.0, 22.0],
-        [10.0, 22.0],
-        [0.0, 22.0],
-        [0.0, -3.0],
-        [2.0, -3.0],
-        [2.0, 0.0],
-        [5.1, 0.0],
-        [5.1, 25.0],
+
+    # For "straight" 3D path mode:
+    #   - waypoints are full 3D coordinates [x, y, z] in world space.
+    #   - camera eye follows these waypoints exactly.
+    "straight_path_waypoints_xyz": [
+        [-3.0, 2, -62.0],
+        [-3.0, 2, -40.0],
+        [-8.0, 2, -40.0],
+        [-8.0, 2, -20.0],
+        [5.0, 2, 8.0],
+        [-3.0, 2, 8.0],
+        [-3.0,2,-62.0]
     ],
+    "straight_patch_size": 15.0,
+    "straight_floor_percentile": 5.0,
+    "straight_start_cam_y": 76.5,
 }
 
 # Global config: everything else (render, video, detection, analysis).
 GLOBAL_CONFIG: Dict[str, Any] = {
-    "outdir": "output/ConferenceHall_demo",
+    "outdir": "output/outdoor-street-demo",
     "seconds": 60.0,
     "fps": 60,
     "fov_deg": 75.0,
     "resolution": [1280, 720],  # [width, height]
     "max_splats": 20_000_000,
-    "detect": True,
+    "detect": False,
     "yolo_model": "models/yolo12n.pt",
     "yolo_conf": 0.65,
     "draw_boxes": True,  # draw YOLO boxes directly on frames when detect=True
@@ -126,8 +145,8 @@ GLOBAL_CONFIG: Dict[str, Any] = {
     "analyze_scene": True,
     "analysis": {
         "grid_res": 512,
-        "slice_thickness_frac": 0.1,
-        "num_slices": 6,
+        "slice_thickness_frac": 0.05,
+        "num_slices": 20,
         "angle_bins": 180,
         # Where to put analysis results (inside outdir)
         "subdir": "analysis",
@@ -144,7 +163,6 @@ GLOBAL_CONFIG: Dict[str, Any] = {
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-
 
 def _compute_num_frames(seconds: float, fps: int) -> int:
     """Compute number of frames from duration and FPS."""
@@ -300,7 +318,9 @@ def _maybe_plot_camera_path(
     )
 
 
-def _build_path_with_behaviors(scene_cfg: Dict[str, Any]) -> List[Tuple[List[float], Optional[Dict[str, Any]]]]:
+def _build_path_with_behaviors(
+    scene_cfg: Dict[str, Any]
+) -> List[Tuple[List[float], Optional[Dict[str, Any]]]]:
     """
     Convert scene config 'path_with_behaviors' (list of dicts) into
     list of (waypoint_xz, behavior) tuples for generate_camera_poses_spline.
@@ -322,7 +342,6 @@ def _build_path_with_behaviors(scene_cfg: Dict[str, Any]) -> List[Tuple[List[flo
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
-
 
 def main(
     scene_cfg: Optional[Dict[str, Any]] = None,
@@ -366,14 +385,8 @@ def main(
     draw_boxes = bool(global_cfg.get("draw_boxes", True))
 
     num_frames = _compute_num_frames(seconds, fps)
-    logger.info(
-        "[MAIN] Scene: %s",
-        scene_path,
-    )
-    logger.info(
-        "[MAIN] Output dir: %s",
-        outdir,
-    )
+    logger.info("[MAIN] Scene: %s", scene_path)
+    logger.info("[MAIN] Output dir: %s", outdir)
     logger.info(
         "[MAIN] Frames to render: %d @ %d FPS, %dx%d, FOV=%.1f, max_splats=%d",
         num_frames,
@@ -388,6 +401,33 @@ def main(
     # 1) Load Gaussians
     # ------------------------------------------------------------------
     gauss = load_gaussians_from_ply(str(scene_path), max_points=max_splats)
+
+    if bool(scene_cfg.get("normalize_scene", False)):
+        norm_cfg = scene_cfg.get("normalization", {}) or {}
+        shift_y_to_zero = bool(norm_cfg.get("shift_y_to_zero", True))
+
+        logger.info(
+            "[MAIN] Normalizing scene axes (yaw-only). shift_y_to_zero=%s",
+            shift_y_to_zero,
+        )
+
+        gauss, norm_meta = normalize_scene_axes(
+            gauss,
+            shift_y_to_zero=True,
+            align_floor=True,
+            align_yaw=True,
+            max_floor_tilt_deg=45.0,
+            max_yaw_deg=60.0,
+        )
+
+        logger.info(
+            "[MAIN] Scene normalized. yaw_deg=%.3f, main_dir_before=%s, main_dir_after=%s",
+            float(norm_meta.get("yaw_deg", 0.0)),
+            np.round(norm_meta.get("main_dir_xz_before", [0, 0, 0]), 4),
+            np.round(norm_meta.get("main_dir_xz_after", [0, 0, 0]), 4),
+        )
+    else:
+        logger.info("[MAIN] Scene normalization is disabled in scene config.")
 
     # ------------------------------------------------------------------
     # 2) Camera poses
@@ -407,23 +447,30 @@ def main(
         path_type_meta = "spline_xz_with_behaviors"
 
     elif path_type == "straight":
-        waypoints_xz = scene_cfg.get("straight_path_waypoints_xz")
-        if not waypoints_xz:
+        waypoints_xyz = scene_cfg.get("straight_path_waypoints_xyz")
+        if not waypoints_xyz:
             raise ValueError(
-                "Scene config path_type='straight' but 'straight_path_waypoints_xz' is empty."
+                "Scene config path_type='straight' but 'straight_path_waypoints_xyz' is empty."
             )
-        poses = generate_camera_poses_straight_path(
+
+        patch_size = float(scene_cfg.get("straight_patch_size", 6.0))
+        floor_percentile = float(scene_cfg.get("straight_floor_percentile", 5.0))
+        start_cam_y_cfg = scene_cfg.get("straight_start_cam_y", None)
+        start_cam_y = float(start_cam_y_cfg) if start_cam_y_cfg is not None else None
+
+        poses = generate_camera_poses_straight_path_3d(
             means=gauss.means,
+            waypoints_xyz=waypoints_xyz,
             num_frames=num_frames,
-            waypoints_xz=waypoints_xz,
-            height_fraction=0.0,
+            patch_size=patch_size,
+            start_cam_y=start_cam_y,
+            floor_percentile=floor_percentile,
             lookahead_fraction=0.05,
         )
-        path_type_meta = "straight_polyline_xz"
+        path_type_meta = "straight_3d_local_floor"
 
     else:
         raise ValueError(f"Unsupported path_type in scene config: {path_type!r}")
-
     # Plot camera path on density map (if enabled)
     _maybe_plot_camera_path(gauss, poses, outdir, global_cfg)
 
@@ -444,7 +491,7 @@ def main(
     _maybe_run_scene_analysis(gauss, scene_path, outdir, global_cfg)
 
     # ------------------------------------------------------------------
-    # 5) Render + stream to video (and optional YOLO)
+    # 5) Render + stream to video (and optional YOLO + revisit)
     # ------------------------------------------------------------------
     out_mp4 = outdir / "panorama_tour.mp4"
 
@@ -462,8 +509,9 @@ def main(
         yolo_model_path=yolo_model,
         yolo_conf=yolo_conf,
         draw_boxes=draw_boxes,
-        revisit_top_k=5,              # например, вернуться к 5 объектам
-        revisit_min_world_dist=2.5,   # минимальная дистанция между объектами в мире
+        # Revisit configuration (second pass) — can be moved to GLOBAL_CONFIG later
+        revisit_top_k=5,
+        revisit_min_world_dist=2.5,
         revisit_stop_seconds=0.5,
         revisit_interp_seconds=1.0,
     )
@@ -499,7 +547,7 @@ def main(
     logger.info("[MAIN] Camera path JSON written: %s", cam_json)
 
     # ------------------------------------------------------------------
-    # 7 Optional YOLO detections JSON (already computed during rendering)
+    # 7) Optional YOLO detections JSON (already computed during rendering)
     # ------------------------------------------------------------------
     if detect and dets is not None:
         det_json = outdir / "detections_yolo.json"
@@ -508,6 +556,7 @@ def main(
         logger.info("[MAIN] YOLO detections JSON written: %s", det_json)
 
     logger.info("[MAIN] Done.")
+
 
 if __name__ == "__main__":
     main()

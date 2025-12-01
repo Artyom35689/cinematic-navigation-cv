@@ -11,6 +11,20 @@ This project is a small cinematic navigation pipeline on top of a 3D Gaussian Sp
 - Has two main development branches:
   - **main**: flat XZ path + YOLO + revisit.
   - **3d-planner**: scene normalization + 3D path along waypoints + local floor sampling.
+ 
+## Project goals & status
+
+- [x] 1. Render a video from inside the scene (no need to be realistic)
+- [x] 2. Detect objects in the rendered video
+- [x] 3. 3D object detection
+- [x] 4. Path planning
+- [x] 5. Obstacle avoidance
+- [x] 6. Rendered video that covers most of the scene/area
+- [ ] 7. Render a 360° video
+- [ ] 8. Interactive demo
+- [ ] 9. Real-time preview of the scene or pipeline
+- [x] 10. Produce artistic / professional / innovative / realistic result videos (high-quality rendering)
+
 
 ---
 
